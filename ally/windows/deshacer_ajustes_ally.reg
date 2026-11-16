@@ -1,7 +1,7 @@
 Windows Registry Editor Version 5.00
 
-; Deshace ajustes_ally.reg: HAGS encendido (lo normal en Windows 11) y TdrDelay de vuelta a su valor por defecto.
-; Reinicia Windows despues.
+; EN: Undoes ajustes_ally.reg: HAGS back on (the Windows 11 default) and TdrDelay back to its default. Restart afterwards.
+; ES: Deshace ajustes_ally.reg: HAGS encendido (lo normal en Windows 11) y TdrDelay a su valor por defecto. Reinicia despues.
 
 [HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers]
 "HwSchMode"=dword:00000002

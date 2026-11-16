@@ -1,5 +1,7 @@
-# Imagen para compilar el juego de Windows desde Linux o macOS (la usa ally/compilar/compilar.sh).
-# El contexto es la raíz del repositorio: docker build -f ally/compilar/Dockerfile .
+# EN: Image for building the Windows game on Linux or macOS (used by ally/compilar/compilar.sh).
+#     The build context is the repository root: docker build -f ally/compilar/Dockerfile .
+# ES: Imagen para compilar el juego de Windows desde Linux o macOS (la usa ally/compilar/compilar.sh).
+#     El contexto es la raíz del repositorio: docker build -f ally/compilar/Dockerfile .
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
