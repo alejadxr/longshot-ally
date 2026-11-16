@@ -553,8 +553,9 @@ void display_main() {
         last_at = j.at;
         if (!stat.since) stat.since = j.at;
         if (j.at - stat.since > 5000000000LL) {
-            logf("vk: frame interpolation: %d frames shown on time, %d late (over 2 ms); shown apart: <7 ms %d, 7-9 %d, 9-12 %d, "
-                 "12-17 %d, 17-25 %d, over 25 %d", stat.on_time, stat.late, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
+            logf("vk: frame interpolation: %d frames shown on time, %d late (over 2 ms), %d ahead presents not shown; shown apart: "
+                 "<7 ms %d, 7-9 %d, 9-12 %d, 12-17 %d, 17-25 %d, over 25 %d", stat.on_time, stat.late, stat.skipped, hist[0], hist[1],
+                 hist[2], hist[3], hist[4], hist[5]);
             memset(hist, 0, sizeof hist);
             stat = {0, 0, 0, j.at};
         }
@@ -573,7 +574,9 @@ void display_main() {
         // 5080, 60 fps), and a VRR display's refresh changed every frame (flicker on OLED). Now a set's copies go to the GPU
         // together, the first one's end is waited for, and only the presents keep their times on the line.
         static const bool ahead_env = !getenv("RX_VK_PRESENT_AHEAD") || atoi(getenv("RX_VK_PRESENT_AHEAD")) != 0;
-        const bool ahead = present_ahead_wanted(ahead_env, pace, shown, dev.swap_spare.load(std::memory_order_relaxed));
+        static int ahead_fail_streak = 0;   // (fork: ahead presents not shown in a row)
+        static bool ahead_broken = false;   // (fork: left off for the run after 30 of them)
+        const bool ahead = !ahead_broken && present_ahead_wanted(ahead_env, pace, shown, dev.swap_spare.load(std::memory_order_relaxed));
         PendingPresent pending[kMaxMult];
         if (ahead) {
             static bool said;
@@ -599,8 +602,24 @@ void display_main() {
             const int64_t t = now_ns();
             if (ahead) {
                 if (!present_commit(pending[k])) {   // (not shown: the line goes on, and the overlay and the counts leave it out)
-                    next_show = t + step;
-                    continue;
+                    // (fork) the screen held the last frame while the game went on (the ocarina's song, ROG Ally): every ahead
+                    // present failed and nothing else showed them. Now shown the usual way when no image of this set is held
+                    // for it (nothing deferred) or the swapchain was made again since; 30 in a row: present ahead off for the run
+                    stat.skipped++;
+                    if (++ahead_fail_streak >= 30 && !ahead_broken) {
+                        ahead_broken = true;
+                        logf("vk: (fork) present ahead: 30 frames in a row not shown: left off for the run, frames shown as they are made");
+                    }
+                    const bool safe = !pending[k].used || pending[k].swapchain_generation != dev.swapchain_generation;
+                    if (!safe) {
+                        next_show = t + step;
+                        continue;
+                    }
+                    present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);
+                    reflex_present_frame = (timed ? j.set->game[k] : k == j.set->made) ? j.set->reflex_id : 0;
+                    present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
+                } else {
+                    ahead_fail_streak = 0;
                 }
             } else {
                 present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);

@@ -22,6 +22,7 @@
 #include "hos_sdl.h"
 #include "hd_rumble.h"
 #include "hos_motion.h"
+#include "hos_imu_rate.h"   /* (ally-fork: the device's own motion sensors, at their full rate) */
 #include "steam_pads.h"
 #include "../gpu/vk/vk_api.h"   /* (HOS_PAD_*) */
 #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
@@ -219,6 +220,7 @@ static void motion_poll(int64_t now, int count) {
         if (want && pads[i].motion_on && (pick < 0 || pads[i].used_ns > pads[pick].used_ns)) pick = i;
     }
     InterlockedExchange(&gyro_status, any ? 2 : count ? 1 : 0);
+    if (want && any) hos_imu_rate_start();   /* (ally-fork: once; a ROG Ally's pad has the device's sensors fused in by SDL) */
     float a[3], g[3];
     const int read = pick >= 0 && hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, a, 3) &&
                      hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_GYRO, g, 3);
@@ -228,7 +230,9 @@ static void motion_poll(int64_t now, int count) {
     {
         static float last_g[3];
         static int64_t same_since, rearm_ns;
-        if (read && !memcmp(g, last_g, sizeof g)) {
+        /* (ally-fork) a device's own gyroscope (a ROG Ally's, fused into its pad by SDL) sends nothing while it is still: its
+           readings hold at rest, which is no stall, and turning it off and on every few seconds left gaps */
+        if (read && !memcmp(g, last_g, sizeof g) && !hos_imu_rate_has_gyro()) {
             if (!same_since) same_since = now;
             else if (now - same_since > 1200000000LL && now >= rearm_ns) {
                 hos_sdl_pad_sensor_enable(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, 0);

@@ -6755,7 +6755,11 @@ bool fallback_compute_pipelines(Program& p) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = si;
         ci.layout = p.layout;
-        if (dev.task_mesh_fallback || env_on("RX_VK_NOOPT"))
+        // (ally-fork) the task + mesh fallback built its compute stages without the driver's optimizer on every card: on a Radeon
+        // 780M (ROG Ally, AMD's Windows driver) the whole world's geometry then ran unoptimized. Optimized by default here;
+        // RX_VK_FALLBACK_NOOPT=1 (or RX_VK_NOOPT): without it, as upstream
+        static const bool fallback_noopt = env_on("RX_VK_FALLBACK_NOOPT");
+        if ((dev.task_mesh_fallback && fallback_noopt) || env_on("RX_VK_NOOPT"))
             ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         if (const VkResult r = cached_compute(&ci, &made[i]); r != VK_SUCCESS) {
             {
@@ -8806,6 +8810,16 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
     }
     return true;
 }
+// (ally-fork) the start-up preparation's priority. RX_VK_PREPARE_PRIO=high|above|normal|below (default below, as upstream: on
+// every CPU at High the driver's compiles froze the whole PC; the workers here are upstream's, prepare_cpus())
+static int prepare_priority() {
+    const char* e = getenv("RX_VK_PREPARE_PRIO");
+    if (!e) return THREAD_PRIORITY_BELOW_NORMAL;
+    if (!strcmp(e, "high")) return THREAD_PRIORITY_HIGHEST;
+    if (!strcmp(e, "above")) return THREAD_PRIORITY_ABOVE_NORMAL;
+    if (!strcmp(e, "normal")) return THREAD_PRIORITY_NORMAL;
+    return THREAD_PRIORITY_BELOW_NORMAL;
+}
 /// Every shader of the game, before its first start (vk_shader.cpp, the seed): translated once for this translator, and the
 /// driver's part made once for this driver (see PreparedFor). True: prepared now, either of them.
 /// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
@@ -8922,7 +8936,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
     const auto worker = [&] {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
-        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : prepare_priority());
         for (;;) {
             if (prepare_stopped()) return;
             const size_t i = next++;
@@ -10638,7 +10652,9 @@ void pipeline_cache_save(bool force) {
             };
             bool write = fetch(&n, nullptr) && n && n != pcache_saved_size;
             if (!had) return put_off_now();
-            if (write && !force && play_grown && play_cache_in_use() && n < pcache_saved_size + play_grown) {
+            // (ally-fork) the threshold in play whether or not play generations are in use: with RX_VK_PRECOMPILE=0 there were none
+            // and the whole 950 MB went out at each save for a few KB more, 15 times in a session, a 950 MB buffer each time
+            if (write && !force && play_grown && n < pcache_saved_size + play_grown) {
                 write = false;
                 static std::atomic<int> told{0};
                 if (told++ < 4)

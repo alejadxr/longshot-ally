@@ -962,11 +962,21 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // Passing oldSwapchain retires it even when creation fails. Nothing may acquire from it again.
     retire_swapchain();
     if (invalidate_lost_surface(result)) return false;
+    static unsigned swap_fail_streak = 0;   // (fork: failures in a row on the same surface)
     if (result != VK_SUCCESS) {
         logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
              (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
+        // (fork) AMD's Windows driver gave VK_ERROR_UNKNOWN to every later swapchain on a surface whose swapchain was made
+        // again and failed (ROG Ally 780M, F11 twice: 400+ tries, the picture held). Two in a row: the surface made anew, as a
+        // lost one is (the next attempt, 250 ms on, opens the window's surface again)
+        if (++swap_fail_streak >= 2) {
+            swap_fail_streak = 0;
+            logf("vk: (fork) the swapchain could not be made again twice: the window's surface is made anew");
+            invalidate_lost_surface(VK_ERROR_SURFACE_LOST_KHR);
+        }
         return false;
     }
+    swap_fail_streak = 0;
     if (vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr) != VK_SUCCESS || !n) {
         vkDestroySwapchainKHR(dev.device, sc, nullptr);
         return false;

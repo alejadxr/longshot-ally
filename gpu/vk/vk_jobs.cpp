@@ -1,5 +1,7 @@
 // The worker threads (vk_jobs.h). As many as a third of the hardware threads (2 to 4): the game itself runs six
 // virtual cores, and the replay thread is one of the busiest.
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <exception>
@@ -55,8 +57,18 @@ std::function<void()> with_failure(std::function<void()> fn, std::function<void(
     };
 }
 
+// (ally-fork) RX_VK_JOB_PRIO=normal: the workers at normal priority (below normal by default); the first visit to an area has
+// hundreds of pipelines to build and the game's own threads took the cores from them
+int job_priority() {
+    static const int p = [] {
+        const char* e = getenv("RX_VK_JOB_PRIO");
+        return e && !strcmp(e, "normal") ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL;
+    }();
+    return p;
+}
+
 void worker() {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    SetThreadPriority(GetCurrentThread(), job_priority());
     SetThreadDescription(GetCurrentThread(), L"mkw_vk worker");
     ub_thread_off();
     for (;;) {
