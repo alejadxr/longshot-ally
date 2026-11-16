@@ -1,0 +1,366 @@
+diff --git a/gpu/vk/vk_draw.cpp b/gpu/vk/vk_draw.cpp
+index 7a0b7ab..8541202 100644
+--- a/gpu/vk/vk_draw.cpp
++++ b/gpu/vk/vk_draw.cpp
+@@ -6755,7 +6755,11 @@ bool fallback_compute_pipelines(Program& p) {
+         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+         ci.stage = si;
+         ci.layout = p.layout;
+-        if (dev.task_mesh_fallback || env_on("RX_VK_NOOPT"))
++        // (ally-fork) the task + mesh fallback built its compute stages without the driver's optimizer on every card: on a Radeon
++        // 780M (ROG Ally, AMD's Windows driver) the whole world's geometry then ran unoptimized. Optimized by default here;
++        // RX_VK_FALLBACK_NOOPT=1 (or RX_VK_NOOPT): without it, as upstream
++        static const bool fallback_noopt = env_on("RX_VK_FALLBACK_NOOPT");
++        if ((dev.task_mesh_fallback && fallback_noopt) || env_on("RX_VK_NOOPT"))
+             ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+         if (const VkResult r = cached_compute(&ci, &made[i]); r != VK_SUCCESS) {
+             {
+@@ -8806,6 +8810,16 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
+     }
+     return true;
+ }
++// (ally-fork) the start-up preparation's priority. RX_VK_PREPARE_PRIO=high|above|normal|below (default below, as upstream: on
++// every CPU at High the driver's compiles froze the whole PC; the workers here are upstream's, prepare_cpus())
++static int prepare_priority() {
++    const char* e = getenv("RX_VK_PREPARE_PRIO");
++    if (!e) return THREAD_PRIORITY_BELOW_NORMAL;
++    if (!strcmp(e, "high")) return THREAD_PRIORITY_HIGHEST;
++    if (!strcmp(e, "above")) return THREAD_PRIORITY_ABOVE_NORMAL;
++    if (!strcmp(e, "normal")) return THREAD_PRIORITY_NORMAL;
++    return THREAD_PRIORITY_BELOW_NORMAL;
++}
+ /// Every shader of the game, before its first start (vk_shader.cpp, the seed): translated once for this translator, and the
+ /// driver's part made once for this driver (see PreparedFor). True: prepared now, either of them.
+ /// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
+@@ -8922,7 +8936,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background, b
+     const auto worker = [&] {
+         ub_thread_off();   // (a background thread: see ub_thread_off)
+         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
+-        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
++        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : prepare_priority());
+         for (;;) {
+             if (prepare_stopped()) return;
+             const size_t i = next++;
+@@ -10638,7 +10652,9 @@ void pipeline_cache_save(bool force) {
+             };
+             bool write = fetch(&n, nullptr) && n && n != pcache_saved_size;
+             if (!had) return put_off_now();
+-            if (write && !force && play_grown && play_cache_in_use() && n < pcache_saved_size + play_grown) {
++            // (ally-fork) the threshold in play whether or not play generations are in use: with RX_VK_PRECOMPILE=0 there were none
++            // and the whole 950 MB went out at each save for a few KB more, 15 times in a session, a 950 MB buffer each time
++            if (write && !force && play_grown && n < pcache_saved_size + play_grown) {
+                 write = false;
+                 static std::atomic<int> told{0};
+                 if (told++ < 4)
+diff --git a/gpu/vk/vk_framegen.cpp b/gpu/vk/vk_framegen.cpp
+index 1343306..d8eb383 100644
+--- a/gpu/vk/vk_framegen.cpp
++++ b/gpu/vk/vk_framegen.cpp
+@@ -553,8 +553,9 @@ void display_main() {
+         last_at = j.at;
+         if (!stat.since) stat.since = j.at;
+         if (j.at - stat.since > 5000000000LL) {
+-            logf("vk: frame interpolation: %d frames shown on time, %d late (over 2 ms); shown apart: <7 ms %d, 7-9 %d, 9-12 %d, "
+-                 "12-17 %d, 17-25 %d, over 25 %d", stat.on_time, stat.late, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5]);
++            logf("vk: frame interpolation: %d frames shown on time, %d late (over 2 ms), %d ahead presents not shown; shown apart: "
++                 "<7 ms %d, 7-9 %d, 9-12 %d, 12-17 %d, 17-25 %d, over 25 %d", stat.on_time, stat.late, stat.skipped, hist[0], hist[1],
++                 hist[2], hist[3], hist[4], hist[5]);
+             memset(hist, 0, sizeof hist);
+             stat = {0, 0, 0, j.at};
+         }
+@@ -573,7 +574,9 @@ void display_main() {
+         // 5080, 60 fps), and a VRR display's refresh changed every frame (flicker on OLED). Now a set's copies go to the GPU
+         // together, the first one's end is waited for, and only the presents keep their times on the line.
+         static const bool ahead_env = !getenv("RX_VK_PRESENT_AHEAD") || atoi(getenv("RX_VK_PRESENT_AHEAD")) != 0;
+-        const bool ahead = present_ahead_wanted(ahead_env, pace, shown, dev.swap_spare.load(std::memory_order_relaxed));
++        static int ahead_fail_streak = 0;   // (fork: ahead presents not shown in a row)
++        static bool ahead_broken = false;   // (fork: left off for the run after 30 of them)
++        const bool ahead = !ahead_broken && present_ahead_wanted(ahead_env, pace, shown, dev.swap_spare.load(std::memory_order_relaxed));
+         PendingPresent pending[kMaxMult];
+         if (ahead) {
+             static bool said;
+@@ -599,8 +602,24 @@ void display_main() {
+             const int64_t t = now_ns();
+             if (ahead) {
+                 if (!present_commit(pending[k])) {   // (not shown: the line goes on, and the overlay and the counts leave it out)
+-                    next_show = t + step;
+-                    continue;
++                    // (fork) the screen held the last frame while the game went on (the ocarina's song, ROG Ally): every ahead
++                    // present failed and nothing else showed them. Now shown the usual way when no image of this set is held
++                    // for it (nothing deferred) or the swapchain was made again since; 30 in a row: present ahead off for the run
++                    stat.skipped++;
++                    if (++ahead_fail_streak >= 30 && !ahead_broken) {
++                        ahead_broken = true;
++                        logf("vk: (fork) present ahead: 30 frames in a row not shown: left off for the run, frames shown as they are made");
++                    }
++                    const bool safe = !pending[k].used || pending[k].swapchain_generation != dev.swapchain_generation;
++                    if (!safe) {
++                        next_show = t + step;
++                        continue;
++                    }
++                    present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);
++                    reflex_present_frame = (timed ? j.set->game[k] : k == j.set->made) ? j.set->reflex_id : 0;
++                    present_image(j.set->frame[k].image, fg.w, fg.h, nullptr, j.set->frame[k].view);
++                } else {
++                    ahead_fail_streak = 0;
+                 }
+             } else {
+                 present_kind.store(timed ? (j.set->game[k] ? 0 : 1) : k < j.set->made ? 1 : 0);
+diff --git a/gpu/vk/vk_jobs.cpp b/gpu/vk/vk_jobs.cpp
+index e0e2620..3fa5d05 100644
+--- a/gpu/vk/vk_jobs.cpp
++++ b/gpu/vk/vk_jobs.cpp
+@@ -1,5 +1,7 @@
+ // The worker threads (vk_jobs.h). As many as a third of the hardware threads (2 to 4): the game itself runs six
+ // virtual cores, and the replay thread is one of the busiest.
++#include <cstdlib>
++#include <cstring>
+ #include <algorithm>
+ #include <atomic>
+ #include <exception>
+@@ -55,8 +57,18 @@ std::function<void()> with_failure(std::function<void()> fn, std::function<void(
+     };
+ }
+ 
++// (ally-fork) RX_VK_JOB_PRIO=normal: the workers at normal priority (below normal by default); the first visit to an area has
++// hundreds of pipelines to build and the game's own threads took the cores from them
++int job_priority() {
++    static const int p = [] {
++        const char* e = getenv("RX_VK_JOB_PRIO");
++        return e && !strcmp(e, "normal") ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL;
++    }();
++    return p;
++}
++
+ void worker() {
+-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++    SetThreadPriority(GetCurrentThread(), job_priority());
+     SetThreadDescription(GetCurrentThread(), L"mkw_vk worker");
+     ub_thread_off();
+     for (;;) {
+diff --git a/gpu/vk/vk_main.cpp b/gpu/vk/vk_main.cpp
+index 665f68c..4837e92 100644
+--- a/gpu/vk/vk_main.cpp
++++ b/gpu/vk/vk_main.cpp
+@@ -962,11 +962,21 @@ bool create_swapchain(uint32_t width, uint32_t height) {
+     // Passing oldSwapchain retires it even when creation fails. Nothing may acquire from it again.
+     retire_swapchain();
+     if (invalidate_lost_surface(result)) return false;
++    static unsigned swap_fail_streak = 0;   // (fork: failures in a row on the same surface)
+     if (result != VK_SUCCESS) {
+         logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
+              (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
++        // (fork) AMD's Windows driver gave VK_ERROR_UNKNOWN to every later swapchain on a surface whose swapchain was made
++        // again and failed (ROG Ally 780M, F11 twice: 400+ tries, the picture held). Two in a row: the surface made anew, as a
++        // lost one is (the next attempt, 250 ms on, opens the window's surface again)
++        if (++swap_fail_streak >= 2) {
++            swap_fail_streak = 0;
++            logf("vk: (fork) the swapchain could not be made again twice: the window's surface is made anew");
++            invalidate_lost_surface(VK_ERROR_SURFACE_LOST_KHR);
++        }
+         return false;
+     }
++    swap_fail_streak = 0;
+     if (vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr) != VK_SUCCESS || !n) {
+         vkDestroySwapchainKHR(dev.device, sc, nullptr);
+         return false;
+diff --git a/host/pad_sdl.c b/host/pad_sdl.c
+index f587e3b..125cfdc 100644
+--- a/host/pad_sdl.c
++++ b/host/pad_sdl.c
+@@ -22,6 +22,7 @@
+ #include "hos_sdl.h"
+ #include "hd_rumble.h"
+ #include "hos_motion.h"
++#include "hos_imu_rate.h"   /* (ally-fork: the device's own motion sensors, at their full rate) */
+ #include "steam_pads.h"
+ #include "../gpu/vk/vk_api.h"   /* (HOS_PAD_*) */
+ #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
+@@ -219,6 +220,7 @@ static void motion_poll(int64_t now, int count) {
+         if (want && pads[i].motion_on && (pick < 0 || pads[i].used_ns > pads[pick].used_ns)) pick = i;
+     }
+     InterlockedExchange(&gyro_status, any ? 2 : count ? 1 : 0);
++    if (want && any) hos_imu_rate_start();   /* (ally-fork: once; a ROG Ally's pad has the device's sensors fused in by SDL) */
+     float a[3], g[3];
+     const int read = pick >= 0 && hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, a, 3) &&
+                      hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_GYRO, g, 3);
+@@ -228,7 +230,9 @@ static void motion_poll(int64_t now, int count) {
+     {
+         static float last_g[3];
+         static int64_t same_since, rearm_ns;
+-        if (read && !memcmp(g, last_g, sizeof g)) {
++        /* (ally-fork) a device's own gyroscope (a ROG Ally's, fused into its pad by SDL) sends nothing while it is still: its
++           readings hold at rest, which is no stall, and turning it off and on every few seconds left gaps */
++        if (read && !memcmp(g, last_g, sizeof g) && !hos_imu_rate_has_gyro()) {
+             if (!same_since) same_since = now;
+             else if (now - same_since > 1200000000LL && now >= rearm_ns) {
+                 hos_sdl_pad_sensor_enable(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, 0);
+diff --git a/host/hos_imu_rate.c b/host/hos_imu_rate.c
+new file mode 100644
+index 0000000..be6e74c
+--- /dev/null
++++ b/host/hos_imu_rate.c
+@@ -0,0 +1,139 @@
++/* (fork) see hos_imu_rate.h */
++#if defined(_WIN32) && (defined(__MINGW32__) || defined(_MSC_VER))
++#define COBJMACROS
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <objbase.h>
++#include <propvarutil.h>
++#include <sensorsapi.h>
++#include <sensors.h>
++#include <portabledevicetypes.h>
++#include <stdio.h>
++void hos_log(const char *fmt, ...);   /* (hos.h) */
++#include "hos_imu_rate.h"
++
++/* (the GUIDs and keys used, defined here: nothing to link beyond ole32) */
++static const GUID kClsidSensorManager = {0x77A1C827, 0xFCD2, 0x4689, {0x89, 0x15, 0x9D, 0x61, 0x3C, 0xC5, 0xFA, 0x3E}};
++static const GUID kIidSensorManager = {0xBD77DB67, 0x45A8, 0x42DC, {0x8D, 0x00, 0x6D, 0xCF, 0x15, 0xF8, 0x37, 0x7A}};
++static const GUID kIidSensorEvents = {0x5D8DCC91, 0x4641, 0x47E7, {0xB7, 0xC3, 0xB7, 0x4F, 0x48, 0xA6, 0xC3, 0x91}};
++static const GUID kTypeGyro = {0x09485F5A, 0x759E, 0x42C2, {0xBD, 0x4B, 0xA3, 0x49, 0xB7, 0x5C, 0x86, 0x43}};
++static const GUID kTypeAccel = {0xC2FB0F5F, 0xE2D2, 0x4C78, {0xBC, 0xD0, 0x35, 0x2A, 0x95, 0x82, 0x81, 0x9D}};
++static const GUID kClsidPdValues = {0x0C15D503, 0xD017, 0x47CE, {0x90, 0x16, 0x7B, 0x3F, 0x97, 0x87, 0x21, 0xCC}};
++static const GUID kIidPdValues = {0x6848F6F2, 0x3155, 0x4F86, {0xB6, 0xF5, 0x26, 0x3E, 0xEE, 0xAB, 0x31, 0x43}};
++#define SENSOR_PROPS_FMTID {0x7F8383EC, 0xD3EC, 0x495C, {0xA8, 0xCF, 0xB8, 0xBB, 0xE8, 0x5C, 0x29, 0x20}}
++static const PROPERTYKEY kMinInterval = {SENSOR_PROPS_FMTID, 12};
++static const PROPERTYKEY kCurInterval = {SENSOR_PROPS_FMTID, 13};
++static const PROPERTYKEY kSensitivity = {SENSOR_PROPS_FMTID, 14};
++#define MOTION_FMTID {0x3F8A69A2, 0x07C5, 0x4E48, {0xA9, 0x65, 0xCD, 0x79, 0x7A, 0xAB, 0x56, 0xD5}}
++static const GUID kIidUnknown = {0x00000000, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
++
++static volatile LONG seen_gyro, seen_accel, started;
++static unsigned interval_used;
++static volatile LONG have_gyro;
++
++/* ---- an ISensorEvents that only counts (held for the run: what keeps this client's settings in force) ---- */
++typedef struct Sink { ISensorEventsVtbl *lpVtbl; LONG refs; volatile LONG *count; } Sink;
++static HRESULT STDMETHODCALLTYPE sk_qi(ISensorEvents *t, REFIID iid, void **out) {
++    if (IsEqualIID(iid, &kIidUnknown) || IsEqualIID(iid, &kIidSensorEvents)) { *out = t; ISensorEvents_AddRef(t); return S_OK; }
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG STDMETHODCALLTYPE sk_addref(ISensorEvents *t) { return InterlockedIncrement(&((Sink *)t)->refs); }
++static ULONG STDMETHODCALLTYPE sk_release(ISensorEvents *t) { return InterlockedDecrement(&((Sink *)t)->refs); }   /* (static) */
++static HRESULT STDMETHODCALLTYPE sk_state(ISensorEvents *t, ISensor *s, SensorState st) { (void)t, (void)s, (void)st; return S_OK; }
++static HRESULT STDMETHODCALLTYPE sk_data(ISensorEvents *t, ISensor *s, ISensorDataReport *r) {
++    (void)s, (void)r;
++    InterlockedIncrement(((Sink *)t)->count);
++    return S_OK;
++}
++static HRESULT STDMETHODCALLTYPE sk_event(ISensorEvents *t, ISensor *s, REFGUID id, IPortableDeviceValues *d) {
++    (void)t, (void)s, (void)id, (void)d;
++    return S_OK;
++}
++static HRESULT STDMETHODCALLTYPE sk_leave(ISensorEvents *t, REFSENSOR_ID id) { (void)t, (void)id; return S_OK; }
++static ISensorEventsVtbl sink_vtbl = {sk_qi, sk_addref, sk_release, sk_state, sk_data, sk_event, sk_leave};
++static Sink sink_gyro = {&sink_vtbl, 1, &seen_gyro}, sink_accel = {&sink_vtbl, 1, &seen_accel};
++
++/* the shortest interval and no threshold on the three axes; returns the interval set (0: none) */
++static unsigned tune(ISensor *s, const PROPERTYKEY *axes) {
++    unsigned ms = 0;
++    PROPVARIANT v;
++    PropVariantInit(&v);
++    if (SUCCEEDED(ISensor_GetProperty(s, &kMinInterval, &v)) && v.vt == VT_UI4) ms = v.ulVal;
++    PropVariantClear(&v);
++    if (!ms) ms = 10;
++    IPortableDeviceValues *want = NULL, *sens = NULL, *got = NULL;
++    if (FAILED(CoCreateInstance(&kClsidPdValues, NULL, CLSCTX_INPROC_SERVER, &kIidPdValues, (void **)&want))) return 0;
++    IPortableDeviceValues_SetUnsignedIntegerValue(want, &kCurInterval, ms);
++    if (SUCCEEDED(CoCreateInstance(&kClsidPdValues, NULL, CLSCTX_INPROC_SERVER, &kIidPdValues, (void **)&sens))) {
++        PROPVARIANT zero;   /* (each axis' threshold, a double as the sensor drivers read it: none) */
++        PropVariantInit(&zero);
++        zero.vt = VT_R8;
++        zero.dblVal = 0.0;
++        for (int i = 0; i < 3; i++) IPortableDeviceValues_SetValue(sens, &axes[i], &zero);
++        IPortableDeviceValues_SetIPortableDeviceValuesValue(want, &kSensitivity, sens);
++    }
++    HRESULT hr = ISensor_SetProperties(s, want, &got);
++    if (got) IPortableDeviceValues_Release(got);
++    if (sens) IPortableDeviceValues_Release(sens);
++    IPortableDeviceValues_Release(want);
++    return SUCCEEDED(hr) ? ms : 0;
++}
++
++static ISensor *open_one(ISensorManager *m, const GUID *type, Sink *sink, const PROPERTYKEY *axes, unsigned *ms) {
++    ISensorCollection *c = NULL;
++    ISensor *s = NULL;
++    ULONG n = 0;
++    if (FAILED(ISensorManager_GetSensorsByType(m, type, &c)) || !c) return NULL;
++    if (SUCCEEDED(ISensorCollection_GetCount(c, &n)) && n && SUCCEEDED(ISensorCollection_GetAt(c, 0, &s)) && s) {
++        *ms = tune(s, axes);
++        ISensor_SetEventSink(s, (ISensorEvents *)sink);
++    }
++    ISensorCollection_Release(c);
++    return s;
++}
++
++static DWORD WINAPI imu_main(LPVOID unused) {
++    (void)unused;
++    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 1;
++    ISensorManager *m = NULL;
++    if (FAILED(CoCreateInstance(&kClsidSensorManager, NULL, CLSCTX_INPROC_SERVER, &kIidSensorManager, (void **)&m)) || !m) {
++        CoUninitialize();
++        return 1;
++    }
++    static const PROPERTYKEY gyro_axes[3] = {{MOTION_FMTID, 10}, {MOTION_FMTID, 11}, {MOTION_FMTID, 12}};
++    static const PROPERTYKEY accel_axes[3] = {{MOTION_FMTID, 2}, {MOTION_FMTID, 3}, {MOTION_FMTID, 4}};
++    unsigned gms = 0, ams = 0;
++    ISensor *g = open_one(m, &kTypeGyro, &sink_gyro, gyro_axes, &gms);
++    ISensor *a = open_one(m, &kTypeAccel, &sink_accel, accel_axes, &ams);
++    interval_used = gms ? gms : ams;
++    hos_log("hid: (fork) the device's own motion sensors: gyroscope %s, accelerometer %s, asked for readings every %u ms with no "
++            "threshold (what SDL's fused pad reads)", g ? "found" : "none", a ? "found" : "none", interval_used);
++    have_gyro = g != NULL;
++    for (;;) Sleep(INFINITE);   /* (held for the run, with the manager: this thread stays in COM and sleeps) */
++    return 0;
++}
++
++int hos_imu_rate_start(void) {
++    if (InterlockedExchange(&started, 1)) return 1;
++    HANDLE t = CreateThread(NULL, 0, imu_main, NULL, 0, NULL);
++    if (!t) return 0;
++    CloseHandle(t);
++    return 1;
++}
++
++int hos_imu_rate_has_gyro(void) { return have_gyro != 0; }
++void hos_imu_rate_stats(long *gyro, long *accel, unsigned *interval_ms) {
++    if (gyro) *gyro = seen_gyro;
++    if (accel) *accel = seen_accel;
++    if (interval_ms) *interval_ms = interval_used;
++}
++#else
++int hos_imu_rate_start(void) { return 0; }
++int hos_imu_rate_has_gyro(void) { return 0; }
++void hos_imu_rate_stats(long *gyro, long *accel, unsigned *interval_ms) {
++    if (gyro) *gyro = 0;
++    if (accel) *accel = 0;
++    if (interval_ms) *interval_ms = 0;
++}
++#endif
+diff --git a/host/hos_imu_rate.h b/host/hos_imu_rate.h
+new file mode 100644
+index 0000000..4fcf2c7
+--- /dev/null
++++ b/host/hos_imu_rate.h
+@@ -0,0 +1,18 @@
++/* (fork) The ROG Ally's IMU (Bosch, ACPI\BOSC0200) through the Windows sensor API: SDL3 fuses it into the built-in pad, but it
++   never sets a report interval or a change sensitivity, so Windows sends a new reading only when the value moves past the
++   driver's threshold, at its default rate: the gyroscope read the same values for over a second at rest (Hookshot turned it
++   off and on every few seconds) and slow aiming moved in steps. This opens the gyrometer and the accelerometer as a client of
++   its own, asks for their shortest report interval and no change threshold (the sensor stack serves every client the most
++   demanding settings asked), and holds them open with an event sink for the run. Windows only; C, no libraries beyond ole32. */
++#pragma once
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Starts once (later calls do nothing); stats: readings seen by this client since the start (gyro, accel), may be NULL */
++int hos_imu_rate_start(void);
++void hos_imu_rate_stats(long *gyro, long *accel, unsigned *interval_ms);
++/* whether the device has a gyroscope of its own (found by the start): its readings stop at rest, as the driver sends none */
++int hos_imu_rate_has_gyro(void);
++#ifdef __cplusplus
++}
++#endif

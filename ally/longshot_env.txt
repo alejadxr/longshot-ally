@@ -1,0 +1,36 @@
+# longshot_env.txt para la ROG Ally (Z1 Extreme, 16 GB, Windows 11)
+# Va en la carpeta del juego, junto a image.bin. Una variable por línea; las líneas que empiezan por # no cuentan.
+# No pongas comentarios al final de una línea: formarían parte del valor.
+# Ajustes medidos con hookshot-ally; con Longshot aún no se han probado jugando.
+
+# Menos RAM: no precompila al abrir las pipelines de todas las zonas (13 GB en vez de 20 al arrancar).
+# A cambio hay un tirón corto la primera vez que ves algo nuevo.
+RX_VK_PRECOMPILE=0
+
+# No carga en RAM la caché de pipelines del juego (~900 MB); queda la caché en disco del driver AMD.
+RX_VK_PCACHE_LOAD=0
+
+# Suelta la memoria importada que ya no se usa y desaloja la ociosa al 85 % del heap.
+# Sin esto, con 16 GB la pantalla acaba congelada ("present/submit failed (-2)").
+RX_VK_KEEP_RETIRED=0
+RX_VK_IMPORT_HIGH=85
+
+# Presupuesto de texturas. NO subirlo a 3072: dio DEVICE_LOST y pantallazo azul 0x119 al cargar zonas.
+RX_VK_VRAM_MB=2560
+
+# Unos 10 % menos de trabajo de GPU.
+RX_VK_PASS_BARRIER=game
+
+# Optimizador de mesh shaders (driver AMD 32.0.32015 de octubre de 2026 o más nuevo).
+# Con un driver más viejo: quita esta línea y añade RX_VK_TASK_MESH_FALLBACK=1
+RX_VK_MESH_OPT=1
+
+# No esperar a las lecturas de la GPU.
+RX_VK_NO_READBACK_WAIT=1
+
+# Parches de este fork: hilos de trabajo a prioridad normal y preparación de shaders con prioridad alta.
+RX_VK_JOB_PRIO=normal
+RX_VK_PREPARE_PRIO=high
+
+# Arreglo de Longshot para el cuelgue en el Bosque Kokiri con GPUs AMD de portátil (docs/common-issues.md).
+RX_VK_MESH_NOCULL=2c56dc1006942f74

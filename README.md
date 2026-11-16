@@ -1,3 +1,6 @@
+> **Fork para la ROG Ally.** Este repositorio es Longshot con parches y ajustes para la ROG Ally.
+> La guía en español está en [LEEME-ALLY.md](LEEME-ALLY.md); lo de abajo es el README original de Longshot.
+
 <h1 align="center">
   <br>
   <a>

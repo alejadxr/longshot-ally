@@ -1,0 +1,10 @@
+Windows Registry Editor Version 5.00
+
+; Ajustes de graficos para la ROG Ally. Doble clic, aceptar y reiniciar Windows.
+; HwSchMode=1: HAGS (programacion de GPU acelerada por hardware) apagado; con HAGS el driver AMD dio BSOD 0x119.
+; TdrDelay=10: Windows espera 10 s (en vez de 2) antes de reiniciar la GPU durante una compilacion larga de shaders.
+; Para deshacerlo: deshacer_ajustes_ally.reg
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers]
+"HwSchMode"=dword:00000001
+"TdrDelay"=dword:0000000a
